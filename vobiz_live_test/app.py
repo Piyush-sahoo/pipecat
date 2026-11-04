@@ -15,7 +15,7 @@ from pathlib import Path
 import uvicorn
 from fastapi import FastAPI, Request, Response, WebSocket
 from xml.sax.saxutils import escape
-from urllib.parse import urlencode
+from urllib.parse import parse_qs, urlencode
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.frames.frames import (
     Frame,
@@ -62,7 +62,7 @@ async def events() -> list[dict]:
 
 @app.api_route("/answer", methods=["GET", "POST"])
 async def answer(request: Request) -> Response:
-    form = dict(await request.form()) if request.method == "POST" else {}
+    form = {k: v[0] for k, v in parse_qs((await request.body()).decode()).items()}
     q = dict(request.query_params)
     log("answer url requested", event=form.get("Event"), status=form.get("CallStatus"), q=q.get("name"))
     url = f"wss://{request.headers['host']}/ws?{urlencode(q)}"
