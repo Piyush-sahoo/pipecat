@@ -4,7 +4,9 @@ Answers a real Vobiz call, plays a long greeting, and when the far end talks ove
 it, sends an interruption and plays a short reply. /events shows what crossed the wire.
 """
 
+import array
 import asyncio
+import base64
 import json
 import os
 import time
@@ -12,6 +14,8 @@ from pathlib import Path
 
 import uvicorn
 from fastapi import FastAPI, Request, Response, WebSocket
+from xml.sax.saxutils import escape
+from urllib.parse import urlencode
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.frames.frames import (
     Frame,
@@ -31,6 +35,7 @@ HERE = Path(__file__).parent
 GREETING = (HERE / "greeting.pcm").read_bytes()
 REPLY = (HERE / "reply.pcm").read_bytes()
 EVENTS: list[dict] = []
+CAPTURE: dict[str, bytearray] = {}
 T0 = time.monotonic()
 app = FastAPI()
 
@@ -45,6 +50,11 @@ async def health() -> dict:
     return {"ok": True}
 
 
+@app.get("/capture/{name}")
+async def capture(name: str) -> Response:
+    return Response(content=bytes(CAPTURE.get(name, b"")), media_type="application/octet-stream")
+
+
 @app.get("/events")
 async def events() -> list[dict]:
     return EVENTS
@@ -52,26 +62,42 @@ async def events() -> list[dict]:
 
 @app.api_route("/answer", methods=["GET", "POST"])
 async def answer(request: Request) -> Response:
-    log("answer url requested")
+    form = dict(await request.form()) if request.method == "POST" else {}
+    q = dict(request.query_params)
+    log("answer url requested", event=form.get("Event"), status=form.get("CallStatus"), q=q.get("name"))
+    url = f"wss://{request.headers['host']}/ws?{urlencode(q)}"
+    ct = q.get("ct", "audio/x-mulaw;rate=8000")
     xml = (
         '<?xml version="1.0" encoding="UTF-8"?><Response>'
-        '<Stream bidirectional="true" keepCallAlive="true" contentType="audio/x-mulaw;rate=8000">'
-        f"wss://{request.headers['host']}/ws</Stream></Response>"
+        f'<Stream bidirectional="true" keepCallAlive="true" contentType="{ct}">'
+        f"{escape(url)}</Stream></Response>"
     )
     return Response(content=xml, media_type="application/xml")
 
 
+def _swap(b64: str) -> str:
+    a = array.array("h", base64.b64decode(b64))
+    a.byteswap()
+    return base64.b64encode(a.tobytes()).decode()
+
+
 class Logged(VobizFrameSerializer):
     played = 0
+    name_ = ""
+    swap = False
 
     async def serialize(self, frame):
         out = await super().serialize(frame)
         if out:
-            event = json.loads(out).get("event")
+            msg = json.loads(out)
+            event = msg.get("event")
             if event == "playAudio":
                 self.played += 1
                 if self.played == 1:
-                    log("first playAudio sent")
+                    log("first playAudio sent", fmt=msg["media"]["contentType"], rate=msg["media"]["sampleRate"], bytes=len(base64.b64decode(msg["media"]["payload"])))
+                if self.swap and msg["media"]["contentType"] == "audio/x-l16":
+                    msg["media"]["payload"] = _swap(msg["media"]["payload"])
+                    out = json.dumps(msg)
             else:
                 log(f"sent {event}", play_audio_so_far=self.played)
         return out
@@ -80,7 +106,12 @@ class Logged(VobizFrameSerializer):
         msg = json.loads(data)
         if msg.get("event") != "media":
             log(f"received {msg.get('event')}", raw=str(msg)[:160])
+        elif self.swap and msg.get("media", {}).get("payload"):
+            msg["media"]["payload"] = _swap(msg["media"]["payload"])
+            data = json.dumps(msg)
         frame = await super().deserialize(data)
+        if frame is not None and msg.get("event") == "media":
+            CAPTURE.setdefault(self.name_, bytearray()).extend(frame.audio)
         if frame is not None and msg.get("event") == "dtmf":
             log("InputDTMFFrame", digit=frame.button.value)
         return frame
@@ -93,9 +124,9 @@ class Script(FrameProcessor):
         self._replied = False
 
     async def play(self, clip: bytes) -> None:
-        for i in range(0, len(clip), 320):
+        for i in range(0, len(clip), 960):
             await self.push_frame(
-                OutputAudioRawFrame(audio=clip[i : i + 320], sample_rate=8000, num_channels=1)
+                OutputAudioRawFrame(audio=clip[i : i + 960], sample_rate=24000, num_channels=1)
             )
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
@@ -120,11 +151,23 @@ async def ws(websocket: WebSocket) -> None:
     await websocket.accept()
     start = json.loads(await websocket.receive_text())
     log("start event", start=start.get("start"))
+    q = dict(websocket.query_params)
+    fmt = start["start"]["mediaFormat"]
+    in_rate = int(fmt["sampleRate"])
+    out_enc, out_rate = q.get("out_enc") or fmt["encoding"], int(q.get("out_rate") or in_rate)
     serializer = Logged(
         stream_id=start["start"]["streamId"],
         call_id=start["start"]["callId"],
-        params=VobizFrameSerializer.InputParams(auto_hang_up=False),
+        params=VobizFrameSerializer.InputParams(
+            auto_hang_up=False,
+            encoding=fmt["encoding"],
+            vobiz_sample_rate=in_rate,
+            output_encoding=out_enc,
+            output_sample_rate=out_rate,
+        ),
     )
+    serializer.name_ = q.get("name", "x")
+    serializer.swap = q.get("swap") == "1"
     transport = FastAPIWebsocketTransport(
         websocket=websocket,
         params=FastAPIWebsocketParams(
@@ -141,7 +184,7 @@ async def ws(websocket: WebSocket) -> None:
         ]
     )
     worker = PipelineWorker(
-        pipeline, params=PipelineParams(audio_in_sample_rate=8000, audio_out_sample_rate=8000)
+        pipeline, params=PipelineParams(audio_in_sample_rate=in_rate, audio_out_sample_rate=out_rate)
     )
     runner = WorkerRunner(handle_sigint=False)
     await runner.add_workers(worker)

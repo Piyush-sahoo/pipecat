@@ -117,6 +117,92 @@ class TestVobizDeserialize(_SerializerTestCase):
                 self.assertIsNone(await self.serializer.deserialize(message))
 
 
+class TestVobizAudioFormats(unittest.IsolatedAsyncioTestCase):
+    """Every format in https://www.vobiz.ai/docs/xml/stream/audio-formats."""
+
+    async def _serializer(self, pipeline_rate: int, **params) -> VobizFrameSerializer:
+        serializer = VobizFrameSerializer(
+            stream_id=STREAM_ID,
+            params=VobizFrameSerializer.InputParams(auto_hang_up=False, **params),
+        )
+        await serializer.setup(
+            frame_processor_setup(
+                audio_in_sample_rate=pipeline_rate, audio_out_sample_rate=pipeline_rate
+            )
+        )
+        return serializer
+
+    async def test_supported_inbound_formats_decode_20ms_frames(self):
+        for encoding, rate, wire_bytes in (
+            ("audio/x-mulaw", 8000, 160),
+            ("audio/x-l16", 8000, 320),
+            ("audio/x-l16", 16000, 640),
+        ):
+            with self.subTest(encoding=encoding, rate=rate):
+                serializer = await self._serializer(rate, encoding=encoding, vobiz_sample_rate=rate)
+                payload = base64.b64encode(b"\x7f" * wire_bytes).decode()
+                frame = await serializer.deserialize(
+                    json.dumps({"event": "media", "media": {"payload": payload}})
+                )
+                self.assertIsInstance(frame, InputAudioRawFrame)
+                self.assertEqual(frame.sample_rate, rate)
+                self.assertEqual(len(frame.audio), int(rate * 0.02) * 2)
+
+    async def test_supported_outbound_formats_declare_their_real_format(self):
+        for encoding, rate, wire_bytes in (
+            ("audio/x-mulaw", 8000, 160),
+            ("audio/x-l16", 8000, 320),
+            ("audio/x-l16", 16000, 640),
+            ("audio/x-l16", 24000, 960),
+        ):
+            with self.subTest(encoding=encoding, rate=rate):
+                serializer = await self._serializer(
+                    rate, output_encoding=encoding, output_sample_rate=rate
+                )
+                pcm = b"\x00\x10" * int(rate * 0.02)
+                message = json.loads(
+                    await serializer.serialize(
+                        OutputAudioRawFrame(audio=pcm, sample_rate=rate, num_channels=1)
+                    )
+                )
+                self.assertEqual(message["media"]["contentType"], encoding)
+                self.assertEqual(message["media"]["sampleRate"], rate)
+                self.assertEqual(len(base64.b64decode(message["media"]["payload"])), wire_bytes)
+
+    async def test_l16_is_little_endian_on_the_wire(self):
+        serializer = await self._serializer(8000, encoding="audio/x-l16", vobiz_sample_rate=8000)
+        pcm = (0x0102).to_bytes(2, "little") * 160
+        message = json.loads(
+            await serializer.serialize(
+                OutputAudioRawFrame(audio=pcm, sample_rate=8000, num_channels=1)
+            )
+        )
+        self.assertEqual(base64.b64decode(message["media"]["payload"]), b"\x02\x01" * 160)
+
+    async def test_outbound_defaults_to_the_inbound_format(self):
+        serializer = await self._serializer(16000, encoding="audio/x-l16", vobiz_sample_rate=16000)
+        message = json.loads(
+            await serializer.serialize(
+                OutputAudioRawFrame(audio=b"\x00\x10" * 320, sample_rate=16000, num_channels=1)
+            )
+        )
+        self.assertEqual(message["media"]["contentType"], "audio/x-l16")
+        self.assertEqual(message["media"]["sampleRate"], 16000)
+
+    def test_unsupported_formats_are_rejected(self):
+        for params in (
+            {"encoding": "audio/x-l16", "vobiz_sample_rate": 24000},
+            {"encoding": "audio/x-mulaw", "vobiz_sample_rate": 16000},
+            {"output_encoding": "audio/x-mulaw", "output_sample_rate": 24000},
+            {"output_encoding": "audio/x-l16", "output_sample_rate": 48000},
+        ):
+            with self.subTest(params=params), self.assertRaises(ValueError):
+                VobizFrameSerializer(
+                    stream_id=STREAM_ID,
+                    params=VobizFrameSerializer.InputParams(auto_hang_up=False, **params),
+                )
+
+
 class TestVobizHangUp(unittest.IsolatedAsyncioTestCase):
     def _serializer(self) -> VobizFrameSerializer:
         return VobizFrameSerializer(
